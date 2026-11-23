@@ -1,3 +1,4 @@
+import { refinePortraitMatte } from './portraitMatte';
 import { removeBackground, preload as preloadImgly } from '@imgly/background-removal';
 import { canvasToBlob } from './compression';
 
@@ -13,27 +14,11 @@ export interface ForegroundCutoutResult {
    * always re-runs `cleanEdgeSpill` from a clean source without cumulative mutation.
    */
   rawCutoutImageData: ImageData;
-  /** Final Transparent Foreground Canvas after 4-stage matting refinement (`cleanEdgeSpill`) */
+  /** Final Transparent Foreground Canvas after color-guided matting refinement (`cleanEdgeSpill`) */
   foregroundCanvas: HTMLCanvasElement;
   /** Sampled average background RGB from the original photo corners */
   sampledBgRgb: [number, number, number];
   blob: Blob;
-}
-
-/**
- * Helper to identify human skin tone pixels so edge color decontamination
- * never accidentally alters face, ears, neck, or lips.
- */
-function isSkinTonePixel(r: number, g: number, b: number): boolean {
-  return (
-    r > 90 &&
-    g > 42 &&
-    b > 22 &&
-    r > g &&
-    g > b &&
-    r - b > 18 &&
-    r - g > 10
-  );
 }
 
 /**
@@ -156,586 +141,27 @@ export function sampleDominantBackgroundRgb(
   return [245, 245, 245];
 }
 
-/**
- * Keeps ONLY the single main human portrait connected component in the alpha mask.
- * Completely eliminates any floating white islands/debris in the top-right or corners
- * (even if the AI model gave those noise blobs high alpha like 0.4 ~ 0.9).
- */
-function keepLargestPortraitConnectedComponent(
-  alphaMask: Uint8Array,
-  width: number,
-  height: number,
-  minSeedAlpha = 48
-): void {
-  const total = width * height;
-  const labels = new Int32Array(total);
-  const queue = new Int32Array(total);
-  let currentLabel = 0;
-  let bestLabel = -1;
-  let bestScore = -1;
+const sourceAlphaLimits = new WeakMap<ImageData, Uint8Array>();
 
-  const centerX = width * 0.5;
-  const centerY = height * 0.55;
-
-  for (let p = 0; p < total; p++) {
-    if (alphaMask[p] < minSeedAlpha || labels[p] !== 0) continue;
-
-    currentLabel++;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = p;
-    labels[p] = currentLabel;
-
-    let sumX = 0;
-    let sumY = 0;
-
-    while (head < tail) {
-      const curr = queue[head++];
-      const cx = curr % width;
-      const cy = (curr - cx) / width;
-      sumX += cx;
-      sumY += cy;
-
-      // 4-connected neighbors
-      if (cx > 0) {
-        const n = curr - 1;
-        if (labels[n] === 0 && alphaMask[n] >= minSeedAlpha) {
-          labels[n] = currentLabel;
-          queue[tail++] = n;
-        }
-      }
-      if (cx + 1 < width) {
-        const n = curr + 1;
-        if (labels[n] === 0 && alphaMask[n] >= minSeedAlpha) {
-          labels[n] = currentLabel;
-          queue[tail++] = n;
-        }
-      }
-      if (cy > 0) {
-        const n = curr - width;
-        if (labels[n] === 0 && alphaMask[n] >= minSeedAlpha) {
-          labels[n] = currentLabel;
-          queue[tail++] = n;
-        }
-      }
-      if (cy + 1 < height) {
-        const n = curr + width;
-        if (labels[n] === 0 && alphaMask[n] >= minSeedAlpha) {
-          labels[n] = currentLabel;
-          queue[tail++] = n;
-        }
-      }
-    }
-
-    const area = tail;
-    const meanX = sumX / area;
-    const meanY = sumY / area;
-    const distFromCenter = Math.hypot((meanX - centerX) / width, (meanY - centerY) / height);
-    const centralityBonus = Math.max(0.2, 1.2 - distFromCenter);
-    const score = area * centralityBonus;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestLabel = currentLabel;
-    }
-  }
-
-  if (bestLabel === -1) return;
-
-  // Dilate the winning portrait mask by 2px so fine sub-threshold edge hairs attached to the portrait
-  // are preserved, while detached background islands anywhere else are wiped to 0.
-  const keepRegion = new Uint8Array(total);
-  for (let p = 0; p < total; p++) {
-    if (labels[p] === bestLabel) {
-      keepRegion[p] = 1;
-    }
-  }
-
-  for (let pass = 0; pass < 2; pass++) {
-    const bit = pass + 1;
-    const nextBit = pass + 2;
-    for (let y = 1; y < height - 1; y++) {
-      const row = y * width;
-      for (let x = 1; x < width - 1; x++) {
-        const p = row + x;
-        if (keepRegion[p] !== 0) continue;
-        if (
-          keepRegion[p - 1] === bit ||
-          keepRegion[p + 1] === bit ||
-          keepRegion[p - width] === bit ||
-          keepRegion[p + width] === bit
-        ) {
-          keepRegion[p] = nextBit;
-        }
-      }
-    }
-  }
-
-  for (let p = 0; p < total; p++) {
-    if (keepRegion[p] === 0) {
-      alphaMask[p] = 0;
-    }
-  }
-}
-
-/**
- * 4-Stage High-Precision Portrait Alpha Matting & Hair Decontamination Pipeline (`cleanEdgeSpill`):
- *
- * Stage 1: Largest Connected Component Portrait Isolation + Low-Confidence Cutoff
- *   - Eliminates ALL detached background islands/white spots (e.g. top-right corner debris)
- *     by keeping only the primary portrait connected component.
- *
- * Stage 2: Background-Aware Alpha Contrast Curve & Inward Edge Contraction (1~2.5px)
- *   - ISNet (`isnet_quint8`) outputs a soft 4~6px halo around hair where alpha is 60~190
- *     and RGB is pure white/gray background.
- *   - Applies an adaptive S-curve contrast stretch `[lowCut, highCut] -> [0, 255]` combined
- *     with background-color-similarity erosion: outer pixels whose RGB matches the original
- *     white/colored background are aggressively contracted inward, shaving off the white halo.
- *
- * Stage 3: Soft Edge Feathering (3×3 Gaussian Filter)
- *   - Smooths the eroded alpha boundary so hair and shoulder edges look natural without jagged stair-stepping.
- *
- * Stage 4: Deep Inward Hair/Clothing Color Decontamination (10px+ Deep Interior Seed Propagation)
- *   - Seeds ONLY from deep interior pixels (`distToBg >= 4.5px` and `alpha >= 240` and not bright background glare)
- *     so edge white pixels never sample another contaminated edge pixel.
- *   - Replaces/unmixes all white/bright background contamination on outer hair & shoulder edges
- *     with the true interior dark hair or clothing color.
- */
 export function cleanEdgeSpill(
-  rawCutoutImageData: ImageData,
-  bgRgb: [number, number, number],
-  strengthPercent = 80
+  raw: ImageData, bgRgb: [number, number, number], strengthPercent = 80, hasSourceRgb = true
 ): HTMLCanvasElement {
-  const width = rawCutoutImageData.width;
-  const height = rawCutoutImageData.height;
-
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = width;
-  outCanvas.height = height;
-  const ctx = outCanvas.getContext('2d');
-  if (!ctx) return outCanvas;
-
-  // Clone rawCutoutImageData so the original buffer is NEVER modified
-  const clonedData = new Uint8ClampedArray(rawCutoutImageData.data);
-  const outImageData = new ImageData(clonedData, width, height);
-
-  const totalPixels = width * height;
-  const clampedPct = Math.max(0, Math.min(100, strengthPercent));
-  const strength = clampedPct / 100; // 0.0 .. 1.0 (default 0.8)
-
-  const [bgR, bgG, bgB] = bgRgb;
-  const isBlueBg = bgB > bgR + 20 && bgB > bgG + 20;
-  const isRedBg = bgR > bgG + 20 && bgR > bgB + 20;
-
-  // =========================================================================
-  // STAGE 1: 杂点与孤立连通域清理 (Connected-Component Isolation & Noise Cutoff)
-  // =========================================================================
-  // Dynamic low cutoff: at 0% strength -> 38 (0.15), at 80% strength -> 64 (0.25)
-  const baseLowAlphaCutoff = Math.round(38 + strength * 34);
-  const alpha0 = new Uint8Array(totalPixels);
-
-  for (let p = 0; p < totalPixels; p++) {
-    const a = clonedData[p * 4 + 3];
-    alpha0[p] = a < 38 ? 0 : a;
-  }
-
-  // Keep ONLY the main human portrait connected component — wipes out top-right floating white islands!
-  keepLargestPortraitConnectedComponent(alpha0, width, height, Math.max(45, baseLowAlphaCutoff));
-
-  if (clampedPct === 0) {
-    for (let p = 0; p < totalPixels; p++) {
-      clonedData[p * 4 + 3] = alpha0[p];
-    }
-    ctx.putImageData(outImageData, 0, 0);
-    return outCanvas;
-  }
-
-  // =========================================================================
-  // STAGE 2: 背景感知 Alpha 对比度拉伸与 1~2px 形态学向内腐蚀 (Erode)
-  // =========================================================================
-  // First pass: suppress outer halo pixels where alpha is semi-transparent AND RGB is bright white
-  // or very close to the original background color.
-  const contrastAlpha = new Uint8Array(totalPixels);
-  const lowCut = 38 + strength * 46; // at 80% -> ~75
-  const highCut = 242;
-
-  for (let p = 0; p < totalPixels; p++) {
-    const a = alpha0[p];
-    if (a <= lowCut) {
-      contrastAlpha[p] = 0;
-      continue;
-    }
-
-    const i = p * 4;
-    const r = clonedData[i];
-    const g = clonedData[i + 1];
-    const b = clonedData[i + 2];
-
-    // Check similarity to pure white (255,255,255) AND sampled original background (bgR,bgG,bgB)
-    const distToWhite = Math.hypot(255 - r, 255 - g, 255 - b);
-    const distToSampledBg = Math.hypot(bgR - r, bgG - g, bgB - b);
-    const minBgDist = Math.min(distToWhite, distToSampledBg);
-
-    // If a semi-transparent pixel (a < 225) has RGB very close to white/background,
-    // it is part of the outer background halo around hair — raise its effective cutoff
-    let effectiveLowCut = lowCut;
-    if (a < 225 && !isSkinTonePixel(r, g, b)) {
-      const whiteHaloSimilarity = Math.max(0, 1 - minBgDist / 115);
-      effectiveLowCut += whiteHaloSimilarity * strength * 95;
-    }
-
-    if (a <= effectiveLowCut) {
-      contrastAlpha[p] = 0;
-    } else if (a >= highCut) {
-      contrastAlpha[p] = 255;
-    } else {
-      const norm = (a - effectiveLowCut) / Math.max(1, highCut - effectiveLowCut);
-      // Slight gamma > 1 on the lower tail pushes faint white fringes cleanly to 0
-      const curved = Math.pow(norm, 1 + strength * 0.35);
-      contrastAlpha[p] = Math.round(curved * 255);
+  const canvas = document.createElement('canvas');
+  canvas.width = raw.width;
+  canvas.height = raw.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法创建前景画布');
+  const image = ctx.createImageData(raw.width, raw.height);
+  image.data.set(refinePortraitMatte(raw.data, raw.width, raw.height, bgRgb, strengthPercent, hasSourceRgb));
+  const limits = sourceAlphaLimits.get(raw);
+  if (limits) {
+    for (let p = 0; p < limits.length; p++) {
+      const i = 4 * p + 3;
+      image.data[i] = Math.min(image.data[i], limits[p]);
     }
   }
-
-  // Re-run connected component cleanup after contrast thresholding so any newly detached halo specks vanish
-  keepLargestPortraitConnectedComponent(contrastAlpha, width, height, 42);
-
-  // Compute Chamfer distance to transparent background (distToBg)
-  const resScale = Math.max(1, Math.max(width, height) / 600);
-  const stepOrtho = 1 / resScale;
-  const stepDiag = 1.4142 / resScale;
-  const INF = 1e6;
-
-  const distToBg = new Float32Array(totalPixels);
-  for (let p = 0; p < totalPixels; p++) {
-    distToBg[p] = contrastAlpha[p] === 0 ? 0 : INF;
-  }
-
-  // Forward Chamfer pass for distToBg
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      const p = row + x;
-      let d = distToBg[p];
-      if (d === 0) continue;
-      if (x > 0 && distToBg[p - 1] + stepOrtho < d) d = distToBg[p - 1] + stepOrtho;
-      if (y > 0) {
-        const up = p - width;
-        if (distToBg[up] + stepOrtho < d) d = distToBg[up] + stepOrtho;
-        if (x > 0 && distToBg[up - 1] + stepDiag < d) d = distToBg[up - 1] + stepDiag;
-        if (x + 1 < width && distToBg[up + 1] + stepDiag < d) d = distToBg[up + 1] + stepDiag;
-      }
-      distToBg[p] = d;
-    }
-  }
-
-  // Backward Chamfer pass for distToBg
-  for (let y = height - 1; y >= 0; y--) {
-    const row = y * width;
-    for (let x = width - 1; x >= 0; x--) {
-      const p = row + x;
-      let d = distToBg[p];
-      if (d === 0) continue;
-      if (x + 1 < width && distToBg[p + 1] + stepOrtho < d) d = distToBg[p + 1] + stepOrtho;
-      if (y + 1 < height) {
-        const down = p + width;
-        if (distToBg[down] + stepOrtho < d) d = distToBg[down] + stepOrtho;
-        if (x + 1 < width && distToBg[down + 1] + stepDiag < d) d = distToBg[down + 1] + stepDiag;
-        if (x > 0 && distToBg[down - 1] + stepDiag < d) d = distToBg[down - 1] + stepDiag;
-      }
-      distToBg[p] = d;
-    }
-  }
-
-  // Morphological 1~2px Erode + Distance Micro-Contraction
-  const erodedAlpha = new Uint8Array(totalPixels);
-  const erodeBlend = Math.min(1, strength * 1.15);
-
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      const p = row + x;
-      const origA = contrastAlpha[p];
-      if (origA === 0) continue;
-
-      const d = distToBg[p];
-      if (d > 4.5) {
-        erodedAlpha[p] = origA;
-        continue;
-      }
-
-      let min4 = origA;
-      if (x > 0 && contrastAlpha[p - 1] < min4) min4 = contrastAlpha[p - 1];
-      if (x + 1 < width && contrastAlpha[p + 1] < min4) min4 = contrastAlpha[p + 1];
-      if (y > 0 && contrastAlpha[p - width] < min4) min4 = contrastAlpha[p - width];
-      if (y + 1 < height && contrastAlpha[p + width] < min4) min4 = contrastAlpha[p + width];
-
-      let min8 = min4;
-      if (y > 0 && x > 0 && contrastAlpha[p - width - 1] < min8) min8 = contrastAlpha[p - width - 1];
-      if (y > 0 && x + 1 < width && contrastAlpha[p - width + 1] < min8) min8 = contrastAlpha[p - width + 1];
-      if (y + 1 < height && x > 0 && contrastAlpha[p + width - 1] < min8) min8 = contrastAlpha[p + width - 1];
-      if (y + 1 < height && x + 1 < width && contrastAlpha[p + width + 1] < min8) min8 = contrastAlpha[p + width + 1];
-
-      const targetEroded = strength >= 0.6 ? Math.round(min4 * 0.35 + min8 * 0.65) : min4;
-      let nextA = Math.round(origA * (1 - erodeBlend) + targetEroded * erodeBlend);
-
-      const erodeRadiusPx = 1.65 * strength;
-      if (d <= erodeRadiusPx) {
-        const hardCut = erodeRadiusPx * 0.55;
-        if (d <= hardCut) {
-          nextA = 0;
-        } else {
-          const ramp = (d - hardCut) / Math.max(0.05, erodeRadiusPx - hardCut);
-          nextA = Math.min(nextA, Math.round(origA * Math.max(0, Math.min(1, ramp))));
-        }
-      }
-
-      erodedAlpha[p] = nextA < 28 ? 0 : nextA;
-    }
-  }
-
-  // =========================================================================
-  // STAGE 3: 边缘微弱羽化 (3×3 Gaussian Edge Feathering)
-  // =========================================================================
-  const featheredAlpha = new Uint8Array(totalPixels);
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      const p = row + x;
-      const d = distToBg[p];
-      const centerA = erodedAlpha[p];
-
-      if (d > 4.0 || x === 0 || x === width - 1 || y === 0 || y === height - 1) {
-        featheredAlpha[p] = centerA;
-        continue;
-      }
-
-      const sum =
-        erodedAlpha[p - width - 1] +
-        2 * erodedAlpha[p - width] +
-        erodedAlpha[p - width + 1] +
-        2 * erodedAlpha[p - 1] +
-        4 * centerA +
-        2 * erodedAlpha[p + 1] +
-        erodedAlpha[p + width - 1] +
-        2 * erodedAlpha[p + width] +
-        erodedAlpha[p + width + 1];
-
-      const blurred = sum >> 4;
-      if (centerA === 0) {
-        featheredAlpha[p] = 0;
-      } else {
-        const finalA = Math.round(centerA * 0.3 + blurred * 0.7);
-        featheredAlpha[p] = finalA < 24 ? 0 : finalA;
-      }
-    }
-  }
-
-  // =========================================================================
-  // STAGE 4: 深层向内采样发丝/衣物颜色去污 (Deep Inward Color Decontamination)
-  // =========================================================================
-  // Crucial fix: ONLY seed interior color donors from pixels that are BOTH:
-  //   1. At least 4.5px deep inside the portrait (`distToBg[p] >= 4.5`)
-  //   2. Fully opaque (`featheredAlpha[p] >= 242`)
-  //   3. Not bright white background glare (`luma < 215`)
-  // This guarantees outer hair strands sample genuine dark hair color 5~12px inside the head,
-  // NEVER an adjacent white-contaminated edge pixel!
-  const distToInterior = new Float32Array(totalPixels);
-  const nearestInterior = new Int32Array(totalPixels);
-
-  for (let p = 0; p < totalPixels; p++) {
-    const a = featheredAlpha[p];
-    const dBg = distToBg[p];
-    const i = p * 4;
-    const r = clonedData[i];
-    const g = clonedData[i + 1];
-    const b = clonedData[i + 2];
-    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-
-    if (a >= 242 && dBg >= 4.5 && luma < 215) {
-      distToInterior[p] = 0;
-      nearestInterior[p] = p;
-    } else {
-      distToInterior[p] = INF;
-      nearestInterior[p] = -1;
-    }
-  }
-
-  // Forward Chamfer propagation of nearest deep interior pixel
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      const p = row + x;
-      let dIn = distToInterior[p];
-      let nearIn = nearestInterior[p];
-      if (dIn === 0) continue;
-
-      if (x > 0 && distToInterior[p - 1] + stepOrtho < dIn) {
-        dIn = distToInterior[p - 1] + stepOrtho;
-        nearIn = nearestInterior[p - 1];
-      }
-      if (y > 0) {
-        const up = p - width;
-        if (distToInterior[up] + stepOrtho < dIn) {
-          dIn = distToInterior[up] + stepOrtho;
-          nearIn = nearestInterior[up];
-        }
-        if (x > 0 && distToInterior[up - 1] + stepDiag < dIn) {
-          dIn = distToInterior[up - 1] + stepDiag;
-          nearIn = nearestInterior[up - 1];
-        }
-        if (x + 1 < width && distToInterior[up + 1] + stepDiag < dIn) {
-          dIn = distToInterior[up + 1] + stepDiag;
-          nearIn = nearestInterior[up + 1];
-        }
-      }
-      distToInterior[p] = dIn;
-      nearestInterior[p] = nearIn;
-    }
-  }
-
-  // Backward Chamfer propagation of nearest deep interior pixel
-  for (let y = height - 1; y >= 0; y--) {
-    const row = y * width;
-    for (let x = width - 1; x >= 0; x--) {
-      const p = row + x;
-      let dIn = distToInterior[p];
-      let nearIn = nearestInterior[p];
-      if (dIn === 0) continue;
-
-      if (x + 1 < width && distToInterior[p + 1] + stepOrtho < dIn) {
-        dIn = distToInterior[p + 1] + stepOrtho;
-        nearIn = nearestInterior[p + 1];
-      }
-      if (y + 1 < height) {
-        const down = p + width;
-        if (distToInterior[down] + stepOrtho < dIn) {
-          dIn = distToInterior[down] + stepOrtho;
-          nearIn = nearestInterior[down];
-        }
-        if (x + 1 < width && distToInterior[down + 1] + stepDiag < dIn) {
-          dIn = distToInterior[down + 1] + stepDiag;
-          nearIn = nearestInterior[down + 1];
-        }
-        if (x > 0 && distToInterior[down - 1] + stepDiag < dIn) {
-          dIn = distToInterior[down - 1] + stepDiag;
-          nearIn = nearestInterior[down - 1];
-        }
-      }
-      distToInterior[p] = dIn;
-      nearestInterior[p] = nearIn;
-    }
-  }
-
-  const MAX_BAND_DIST = 18.0;
-
-  for (let p = 0; p < totalPixels; p++) {
-    const i = p * 4;
-    let finalAlpha = featheredAlpha[p];
-    if (finalAlpha === 0) {
-      clonedData[i + 3] = 0;
-      continue;
-    }
-
-    const dist = distToBg[p];
-    if (dist > MAX_BAND_DIST) {
-      clonedData[i + 3] = finalAlpha;
-      continue;
-    }
-
-    let r = clonedData[i];
-    let g = clonedData[i + 1];
-    let b = clonedData[i + 2];
-
-    if (isSkinTonePixel(r, g, b)) {
-      clonedData[i + 3] = finalAlpha;
-      continue;
-    }
-
-    const nearIdx = nearestInterior[p];
-    // For outer 10px edge band or any semi-transparent pixel, decontaminate white/background halo
-    if (nearIdx >= 0 && (dist <= 10.0 || finalAlpha < 250)) {
-      const ni = nearIdx * 4;
-      const inR = clonedData[ni];
-      const inG = clonedData[ni + 1];
-      const inB = clonedData[ni + 2];
-
-      const edgeLuma = 0.299 * r + 0.587 * g + 0.114 * b;
-      const inLuma = 0.299 * inR + 0.587 * inG + 0.114 * inB;
-
-      // Whenever an outer edge pixel is brighter than its interior donor (e.g. white/gray halo on dark hair or sweater),
-      // replace its contaminated brightness with the interior donor color!
-      if (edgeLuma > inLuma + 6 || finalAlpha < 245) {
-        const lumaDiffRatio = Math.max(0, Math.min(1, (edgeLuma - inLuma) / 70));
-        const translucencyRatio = 1 - finalAlpha / 255;
-        const proximityRatio = Math.max(0, Math.min(1, 1 - dist / 9.0));
-
-        const replaceWeight = Math.min(
-          0.98,
-          Math.max(
-            translucencyRatio * 0.98,
-            lumaDiffRatio * proximityRatio * Math.min(1, strength * 1.25),
-            dist <= 3.5 ? strength * 0.92 : 0
-          )
-        );
-
-        r = Math.round(r * (1 - replaceWeight) + inR * replaceWeight);
-        g = Math.round(g * (1 - replaceWeight) + inG * replaceWeight);
-        b = Math.round(b * (1 - replaceWeight) + inB * replaceWeight);
-
-        // If the original pixel was strongly contaminated by white background in the outermost 3px,
-        // also attenuate its alpha slightly so the hair silhouette looks crisp and natural
-        if (lumaDiffRatio > 0.45 && dist <= 3.0) {
-          finalAlpha = Math.round(finalAlpha * (1 - lumaDiffRatio * strength * 0.45));
-        }
-      }
-    }
-
-    // Deep 18px Blue / Red Backdrop Spill Neutralization for Dark Hair
-    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-    const isEligibleDarkHair = luma < 135;
-    const isEligibleOuterFringe = dist <= 5.0 && luma < 200;
-
-    if (isEligibleDarkHair || isEligibleOuterFringe) {
-      const bandFalloff =
-        dist <= 10.0
-          ? 1.0
-          : Math.max(0, Math.min(1, (MAX_BAND_DIST - dist) / (MAX_BAND_DIST - 10.0)));
-      const decontamStrength = Math.min(1, strength * 1.15) * bandFalloff;
-
-      if (isBlueBg) {
-        if (b > Math.max(r, g) || (isEligibleDarkHair && b > Math.min(r, g) + 6)) {
-          const minRG = Math.min(r, g);
-          b = Math.round(b - (b - minRG) * decontamStrength);
-          if (bgG > bgR + 15 && g > r) {
-            g = Math.round(g - (g - r) * decontamStrength * 0.88);
-          }
-          const darkHairGray = Math.round(0.55 * r + 0.35 * g + 0.1 * b);
-          const grayMix = Math.min(0.85, decontamStrength * (isEligibleDarkHair ? 0.72 : 0.55));
-          r = Math.round(r * (1 - grayMix) + darkHairGray * grayMix);
-          g = Math.round(g * (1 - grayMix) + darkHairGray * grayMix);
-          b = Math.round(b * (1 - grayMix) + darkHairGray * grayMix);
-        }
-      } else if (isRedBg) {
-        if (r > Math.max(g, b) || (isEligibleDarkHair && r > Math.min(g, b) + 6)) {
-          const minGB = Math.min(g, b);
-          r = Math.round(r - (r - minGB) * decontamStrength);
-          const darkHairGray = Math.round(0.1 * r + 0.45 * g + 0.45 * b);
-          const grayMix = Math.min(0.85, decontamStrength * (isEligibleDarkHair ? 0.72 : 0.55));
-          r = Math.round(r * (1 - grayMix) + darkHairGray * grayMix);
-          g = Math.round(g * (1 - grayMix) + darkHairGray * grayMix);
-          b = Math.round(b * (1 - grayMix) + darkHairGray * grayMix);
-        }
-      }
-    }
-
-    clonedData[i] = Math.max(0, Math.min(255, r));
-    clonedData[i + 1] = Math.max(0, Math.min(255, g));
-    clonedData[i + 2] = Math.max(0, Math.min(255, b));
-    clonedData[i + 3] = finalAlpha < 20 ? 0 : finalAlpha;
-  }
-
-  ctx.putImageData(outImageData, 0, 0);
-  return outCanvas;
+  ctx.putImageData(image, 0, 0);
+  return canvas;
 }
 
 /**
@@ -771,8 +197,8 @@ export function blobToRawImageData(blob: Blob): Promise<ImageData> {
 // Local Model & WASM Persistent Cache (Cache API + IndexedDB Fallback)
 // ============================================================================
 
-const MODEL_CACHE_NAME = 'id-photo-ai-model-assets-v1';
-const MODEL_IDB_NAME = 'id_photo_ai_assets_db_v1';
+const MODEL_CACHE_NAME = 'id-photo-ai-model-assets-v2';
+const MODEL_IDB_NAME = 'id_photo_ai_assets_db_v2';
 const MODEL_IDB_STORE = 'chunks';
 
 let isFetchInterceptorInstalled = false;
@@ -827,7 +253,7 @@ async function putIdbCachedBlob(urlKey: string, blob: Blob): Promise<void> {
 
 /**
  * Installs a transparent `window.fetch` wrapper for `/imgly-assets/` requests
- * so all ONNX `small` (`isnet_quint8`) model chunks and WASM binaries are persisted
+ * so all FP16 model chunks and WASM binaries are persisted
  * in Browser Cache Storage API (with IndexedDB fallback) after the first visit.
  */
 function ensureLocalModelPersistentCacheInterceptor(): void {
@@ -910,7 +336,7 @@ export function warmupLocalAiModelInBackground(): void {
     try {
       await preloadImgly({
         publicPath: localPublicPath,
-        model: 'small',
+        model: 'medium',
       });
       hasCachedAllModelAssets = true;
     } catch {
@@ -936,7 +362,7 @@ async function checkIsModelCachedLocally(localPublicPath: string): Promise<boole
     const res = await fetch(`${localPublicPath}resources.json`);
     if (res.ok) {
       const map = await res.json();
-      const firstChunkHash = map?.['/models/small']?.chunks?.[0]?.hash;
+      const firstChunkHash = map?.['/models/medium']?.chunks?.[0]?.hash;
       if (firstChunkHash) {
         const blob = await getIdbCachedBlob(`${localPublicPath}${firstChunkHash}`);
         if (blob && blob.size > 0) {
@@ -953,7 +379,7 @@ async function checkIsModelCachedLocally(localPublicPath: string): Promise<boole
 
 /**
  * Downscales the source image to an offscreen canvas whose longest edge does not exceed
- * `maxInferenceEdge` (default 768px; 640px on mobile devices) before sending to AI inference.
+ * `maxInferenceEdge` before sending to AI inference.
  */
 function createDownscaledInferenceBlob(
   sourceImg: HTMLImageElement | HTMLCanvasElement,
@@ -1004,7 +430,7 @@ function createDownscaledInferenceBlob(
  * high-resolution photo dimensions (`origW × origH`) and composites it onto the original
  * high-definition RGB pixels.
  */
-async function compositeUpscaledMaskWithOriginalHd(
+export async function compositeUpscaledMaskWithOriginalHd(
   lowResCutoutBlob: Blob,
   originalImg: HTMLImageElement | HTMLCanvasElement
 ): Promise<ImageData> {
@@ -1057,10 +483,16 @@ async function compositeUpscaledMaskWithOriginalHd(
   const upscaledMaskData = maskCtx.getImageData(0, 0, origW, origH).data;
 
   const totalBytes = hdPixels.length;
+  let limits: Uint8Array | undefined;
   for (let i = 3; i < totalBytes; i += 4) {
-    hdPixels[i] = upscaledMaskData[i];
+    if (hdPixels[i] < 255) {
+      limits ??= new Uint8Array(totalBytes / 4).fill(255);
+      limits[(i - 3) / 4] = hdPixels[i];
+    }
+    hdPixels[i] = Math.min(hdPixels[i], upscaledMaskData[i]);
   }
 
+  if (limits) sourceAlphaLimits.set(hdImageData, limits);
   return hdImageData;
 }
 
@@ -1076,6 +508,8 @@ export async function aiPortraitCutout(
   ensureLocalModelPersistentCacheInterceptor();
 
   const localPublicPath = `${window.location.origin}/imgly-assets/`;
+  // Share the pending asset warmup with an immediate first upload.
+  await preloadPromise;
   const isCached = await checkIsModelCachedLocally(localPublicPath);
 
   onProgress?.({
@@ -1102,10 +536,7 @@ export async function aiPortraitCutout(
     });
   }
 
-  const isMobileViewport =
-    typeof window !== 'undefined' && (window.innerWidth < 768 || navigator.maxTouchPoints > 1);
-  const maxInferenceEdge = isMobileViewport ? 640 : 768;
-
+  const maxInferenceEdge = 1024; // Native IS-Net input resolution.
   const { blob: downscaledBlob } = await createDownscaledInferenceBlob(
     sourceElement,
     maxInferenceEdge
@@ -1117,7 +548,7 @@ export async function aiPortraitCutout(
   try {
     lowResResultBlob = await removeBackground(downscaledBlob, {
       publicPath: localPublicPath,
-      model: 'small',
+      model: 'medium',
       output: {
         format: 'image/png',
         quality: 1,

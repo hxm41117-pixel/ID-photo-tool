@@ -9,14 +9,14 @@ const projectRoot = path.resolve(__dirname, '..');
 const srcDir = path.join(projectRoot, 'node_modules', '@imgly', 'background-removal-data', 'dist');
 const destDir = path.join(projectRoot, 'public', 'imgly-assets');
 
-// Keep ONLY the `small` quantized portrait model (isnet_quint8, ~42MB) + WASM runtimes
+// Keep ONLY the FP16 portrait model (~84 MiB) + WASM runtimes
 // so all devices (SIMD/Non-SIMD, Threaded/Single) load 100% from local static assets.
 const INCLUDED_KEYS = new Set([
   '/onnxruntime-web/ort-wasm.wasm',
   '/onnxruntime-web/ort-wasm-threaded.wasm',
   '/onnxruntime-web/ort-wasm-simd.wasm',
   '/onnxruntime-web/ort-wasm-simd-threaded.wasm',
-  '/models/small',
+  '/models/medium',
 ]);
 
 function main() {

@@ -32,6 +32,7 @@ import {
   aiPortraitCutout,
   AiProgressInfo,
   blobToRawImageData,
+  compositeUpscaledMaskWithOriginalHd,
   cleanEdgeSpill,
   sampleDominantBackgroundRgb,
   warmupLocalAiModelInBackground,
@@ -71,6 +72,7 @@ export function IdPhotoStudio() {
 
   // Immutable raw cutout ImageData & sampled 4-corner background RGB
   const rawCutoutImageDataRef = useRef<ImageData | null>(null);
+  const hasSourceRgbRef = useRef(true);
   const sampledBgRgbRef = useRef<[number, number, number]>([67, 142, 219]);
 
   const [originalBlob, setOriginalBlob] = useState<Blob | null>(null);
@@ -219,7 +221,7 @@ export function IdPhotoStudio() {
   const recomputeForegroundFromRaw = useCallback((strengthVal: number) => {
     const rawData = rawCutoutImageDataRef.current;
     if (!rawData) return null;
-    const cleanedCanvas = cleanEdgeSpill(rawData, sampledBgRgbRef.current, strengthVal);
+    const cleanedCanvas = cleanEdgeSpill(rawData, sampledBgRgbRef.current, strengthVal, hasSourceRgbRef.current);
     setForegroundCanvas(cleanedCanvas);
     setRenderVersion((v) => v + 1);
     return cleanedCanvas;
@@ -238,7 +240,7 @@ export function IdPhotoStudio() {
     [bgMode, recomputeForegroundFromRaw]
   );
 
-  // Unified Local Offline AI portrait cutout -> saves immutable rawCutoutImageData & runs 3-step cleanEdgeSpill
+  // Unified Local Offline AI portrait cutout -> saves immutable rawCutoutImageData & runs edge refinement
   const executeAiCutoutForPhoto = useCallback(
     async (targetBlob: Blob, targetImg: HTMLImageElement) => {
       try {
@@ -256,6 +258,7 @@ export function IdPhotoStudio() {
         );
 
         rawCutoutImageDataRef.current = res.rawCutoutImageData;
+        hasSourceRgbRef.current = true;
         sampledBgRgbRef.current = res.sampledBgRgb;
         setForegroundCanvas(res.foregroundCanvas);
         setBgMode('ai');
@@ -264,7 +267,8 @@ export function IdPhotoStudio() {
         const updatedCache = await saveCachedCutout(
           res.blob,
           res.foregroundCanvas.width,
-          res.foregroundCanvas.height
+          res.foregroundCanvas.height,
+          targetBlob
         );
         setCachedCutouts(updatedCache);
         if (updatedCache[0]) {
@@ -352,21 +356,23 @@ export function IdPhotoStudio() {
     async (item: CachedCutout) => {
       try {
         setErrorMsg(null);
-        const [img, rawImageData] = await Promise.all([
-          loadImageFromBlob(item.blob),
-          blobToRawImageData(item.blob),
-        ]);
-        const bgRgb = sampleDominantBackgroundRgb(rawImageData);
+        const img = await loadImageFromBlob(item.originalBlob ?? item.blob);
+        const rawImageData = item.originalBlob
+          ? await compositeUpscaledMaskWithOriginalHd(item.blob, img)
+          : await blobToRawImageData(item.blob);
+        const bgRgb = sampleDominantBackgroundRgb(item.originalBlob ? img : rawImageData);
+        hasSourceRgbRef.current = Boolean(item.originalBlob);
         rawCutoutImageDataRef.current = rawImageData;
         sampledBgRgbRef.current = bgRgb;
 
         const cleanedCanvas = cleanEdgeSpill(
           rawImageData,
           bgRgb,
-          defringeStrengthRef.current
+          defringeStrengthRef.current,
+          hasSourceRgbRef.current
         );
 
-        setOriginalBlob(item.blob);
+        setOriginalBlob(item.originalBlob ?? item.blob);
         setOriginalImg(img);
         setForegroundCanvas(cleanedCanvas);
         setBgMode('ai');
@@ -409,13 +415,11 @@ export function IdPhotoStudio() {
           `已设为「${found.label} · ${found.defaultBgName}」，抠图完成后立即生效`,
           2500
         );
-      } else {
-        recomputeForegroundFromRaw(defringeStrengthRef.current);
       }
     }
   };
 
-  // Step 2: Background Color Selection -> also re-runs cleanEdgeSpill from rawCutoutImageData
+  // Step 2: Background Color Selection -> reuse the transparent foreground
   const handleSelectBgHex = (hex: string) => {
     setBgHex(hex);
     if (hex === 'transparent') {
@@ -430,26 +434,16 @@ export function IdPhotoStudio() {
       showToast('info', `已预选「${bgName}」，正在完成 AI 抠图（${aiProgress?.percent ?? 50}%），完成后自动换底…`, 2500);
       return;
     }
-    recomputeForegroundFromRaw(defringeStrengthRef.current);
   };
 
   // Ensure we always have a freshly cleaned Transparent Foreground Canvas from rawCutoutImageData
   const ensureTransparentForeground = useCallback(async (): Promise<HTMLCanvasElement> => {
-    if (rawCutoutImageDataRef.current) {
-      const cleaned = cleanEdgeSpill(
-        rawCutoutImageDataRef.current,
-        sampledBgRgbRef.current,
-        defringeStrengthRef.current
-      );
-      setForegroundCanvas(cleaned);
-      setRenderVersion((v) => v + 1);
-      return cleaned;
-    }
+    if (foregroundCanvas) return foregroundCanvas;
     if (!originalBlob || !originalImg) throw new Error('请先选择一张照片');
     const canvas = await executeAiCutoutForPhoto(originalBlob, originalImg);
     if (!canvas) throw new Error('AI 抠图尚未完成，请稍候重试');
     return canvas;
-  }, [originalBlob, originalImg, executeAiCutoutForPhoto]);
+  }, [foregroundCanvas, originalBlob, originalImg, executeAiCutoutForPhoto]);
 
   // Step 3A: Generate Single ID Photo (+ optional 6-inch print layout)
   const handleGenerateSingle = useCallback(async () => {
@@ -954,8 +948,8 @@ export function IdPhotoStudio() {
             </div>
             <div className="text-[10px] text-slate-500 truncate">
               {isAiRunning
-                ? aiProgress?.stageLabel || '正在加载本地轻量模型…'
-                : '本地轻量量化模型 · 缩放推理 + 原图高清合成'}
+                ? aiProgress?.stageLabel || '正在加载本地人像模型…'
+                : '本地 FP16 人像模型 · 缩放推理 + 原图高清合成'}
             </div>
           </div>
         </div>
@@ -976,7 +970,7 @@ export function IdPhotoStudio() {
       {/* Unified Edge Defringe / Erode & Feather / Color Decontamination Slider (default 80%) */}
       <div className="bg-white rounded-lg border border-slate-200/70 p-2.5 space-y-1.5">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-slate-700 font-medium">边缘微缩羽化与去白边/去溢色强度</span>
+          <span className="text-slate-700 font-medium">边缘修复强度</span>
           <div className="flex items-center gap-1.5">
             {defringeStrength !== 80 && (
               <button
@@ -1000,14 +994,14 @@ export function IdPhotoStudio() {
           className="w-full h-1.5 bg-slate-200 rounded-lg cursor-pointer"
         />
         <div className="flex justify-between text-[10px] text-slate-400">
-          <span>0%（仅清理低置信杂点）</span>
-          <span>80%（推荐，1~2px微缩+去白边）</span>
-          <span>100%（强力收缩去污）</span>
+          <span>0% 原始蒙版</span>
+          <span>80% 默认</span>
+          <span>100% 完整修正</span>
         </div>
       </div>
 
       <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
-        <span>已自动开启低透明杂点清理、1~2px 边缘微缩羽化与发丝颜色去污</span>
+        <span>使用原图颜色修复轮廓和内部小孔</span>
         {bgMode === 'original' ? (
           <button
             type="button"

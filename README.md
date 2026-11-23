@@ -8,7 +8,7 @@
 # 1. 安装依赖
 npm install
 
-# 2. 提取本地 AI 抠图模型与 WASM 至 public/bg-removal-assets/
+# 2. 提取本地 AI 抠图模型与 WASM 至 public/imgly-assets/
 npm run prepare:models
 
 # 3. 本地开发预览
@@ -20,10 +20,10 @@ npm run build
 
 ## 核心特性
 
-1. **纯本地免费高精度 AI 抠图 + 全图封闭空隙去底 + 18px 发丝深层去色溢（`cleanEdgeSpill`）**：
-   - `predev` / `prebuild` 自动同步 `@imgly/background-removal-data` 的 WASM 内核与高精度 `medium`（FP16）人像分割模型至 `public/imgly-assets/`，运行时优先从 `${window.location.origin}/imgly-assets/` 本地加载，本地异常时自动降级至官方/jsDelivr 备用镜像，并提供 Toast 状态与报错提示。
-   - 纯色底快速换底在四角泛洪填充基础上增加**全局颜色距离扫描**，自动清除发丝与肩颈之间的封闭蓝/红底空隙且保护人脸肤色。
-   - `cleanEdgeSpill` 覆盖距离任意透明像素 **`18px`** 保护带，针对非肤色暗部发丝强行压低蓝色/红色溢出通道至 `Math.min(r, g)`（默认强度 `80%`），彻底消除蓝底转红底/白底后发丝内部的蓝色反光。
+1. **本地 AI 人像抠图与换底**：
+   - 构建时同步 FP16 人像分割模型和 WASM 到 `public/imgly-assets/`。浏览器从本站加载模型，照片在本地处理。
+   - 推理输入最长边为 1024 像素。程序将软蒙版映射回原图，用轮廓两侧的颜色估计发丝透明度，并校正混入的旧底色。边缘修复强度设为 0% 可查看模型的原始蒙版。
+   - 更换背景和导出照片复用预览中的透明前景。新保存的本地历史记录包含原图，可重新推理。
 2. **极简 1-2-3 线性步骤流（PC 双栏 / 移动端原生修图布局）**：
    - **PC 端（`>= 768px`）**：左侧纯粹构图预览（底部默认折叠「抠图方式与边缘微调」），右侧按「1. 选择使用场景 → 2. 确认背景底色 → 3. 导出与打包」三步走；自定义规格支持 `300 DPI` / `350 DPI` 快捷切换与 **`72 ~ 600` 自定义 DPI 数字输入**（实时写入 JFIF 元数据）。
    - **移动端（`< 768px`）**：顶部 `sticky top-0` 吸顶预览台（`36vh ~ 40vh`）+ 中部三标签切换控制台（`① 场景与尺寸` / `② 背景底色` / `③ 抠图微调`）+ 底部悬浮操作栏与底部抽屉弹窗（Bottom Sheet）出图，切换任意底色或尺寸时无需滚动即可实时看见顶部预览变化。
@@ -31,5 +31,5 @@ npm run build
 
 ## 部署说明
 
-- `dist/` 目录中已自动包含 `bg-removal-assets/`（量化人像分割 ONNX 模型分片与 WASM 内核，单片均 ≤ 4 MB，完全满足 Cloudflare Pages 单文件 25 MB 上限）。
-- 运行时通过相对路径 `./bg-removal-assets/` 加载，不访问任何海外默认 CDN。
+- `dist/` 目录中已自动包含 `imgly-assets/`（FP16 人像分割 ONNX 模型分片与 WASM 内核，单片均 ≤ 4 MB，完全满足 Cloudflare Pages 单文件 25 MB 上限）。
+- 运行时通过相对路径 `./imgly-assets/` 加载，不访问任何海外默认 CDN。

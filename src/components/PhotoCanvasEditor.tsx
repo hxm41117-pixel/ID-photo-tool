@@ -57,6 +57,10 @@ export function PhotoCanvasEditor({
 
   // Compute display box size preserving aspect ratio
   const aspectRatio = targetWidth / Math.max(1, targetHeight);
+  const sourceWidth = image instanceof HTMLImageElement ? image.naturalWidth : image.width;
+  const sourceHeight = image instanceof HTMLImageElement ? image.naturalHeight : image.height;
+  const fitWidthScale = Math.min(1, aspectRatio * sourceHeight / Math.max(1, sourceWidth));
+  const minScale = Math.min(0.5, fitWidthScale);
   const maxBoxHeight = compact ? 196 : 360;
   const maxBoxWidth = compact ? 168 : 300;
   let displayW = maxBoxHeight * aspectRatio;
@@ -110,12 +114,12 @@ export function PhotoCanvasEditor({
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.07 : 0.93;
-      const nextScale = Math.max(0.5, Math.min(3.0, Number((transform.scale * factor).toFixed(3))));
+      const nextScale = Math.max(minScale, Math.min(3.0, Number((transform.scale * factor).toFixed(3))));
       onTransformChange({ ...transform, scale: nextScale });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [transform, onTransformChange]);
+  }, [transform, onTransformChange, minScale]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -193,6 +197,17 @@ export function PhotoCanvasEditor({
     dragStateRef.current.isDragging = false;
     dragStateRef.current.pinchStartDist = null;
   };
+
+  const fitShouldersButton = fitWidthScale < 1 && (
+    <button
+      type="button"
+      onClick={() => onTransformChange({ scale: fitWidthScale, offsetX: 0, offsetY: (1 - fitWidthScale) / 2 })}
+      className="shrink-0 rounded-lg bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
+      title="保留原图全宽并将人物底部贴齐画框"
+    >
+      保留肩宽
+    </button>
+  );
 
   const handleReset = () => {
     onTransformChange({ scale: 1, offsetX: 0, offsetY: 0 });
@@ -339,7 +354,7 @@ export function PhotoCanvasEditor({
             onClick={() =>
               onTransformChange({
                 ...transform,
-                scale: Math.max(0.5, Number((transform.scale - 0.08).toFixed(2))),
+                scale: Math.max(minScale, Number((transform.scale - 0.08).toFixed(2))),
               })
             }
             aria-label="缩小"
@@ -349,14 +364,14 @@ export function PhotoCanvasEditor({
           </button>
           <input
             type="range"
-            min={0.5}
+            min={minScale}
             max={2.6}
             step={0.01}
             value={transform.scale}
             onChange={(e) =>
               onTransformChange({ ...transform, scale: parseFloat(e.target.value) })
             }
-            className="flex-1 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
+            className="min-w-0 flex-1 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
           />
           <button
             type="button"
@@ -378,6 +393,7 @@ export function PhotoCanvasEditor({
           >
             {showGuide ? '隐藏线' : '参考线'}
           </button>
+          {fitShouldersButton}
           <button
             type="button"
             onClick={handleReset}
@@ -394,7 +410,7 @@ export function PhotoCanvasEditor({
               onClick={() =>
                 onTransformChange({
                   ...transform,
-                  scale: Math.max(0.5, Number((transform.scale - 0.08).toFixed(2))),
+                  scale: Math.max(minScale, Number((transform.scale - 0.08).toFixed(2))),
                 })
               }
               aria-label="缩小"
@@ -404,14 +420,14 @@ export function PhotoCanvasEditor({
             </button>
             <input
               type="range"
-              min={0.5}
+              min={minScale}
               max={2.6}
               step={0.01}
               value={transform.scale}
               onChange={(e) =>
                 onTransformChange({ ...transform, scale: parseFloat(e.target.value) })
               }
-              className="flex-1 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
+              className="min-w-0 flex-1 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
             />
             <button
               type="button"
@@ -440,6 +456,7 @@ export function PhotoCanvasEditor({
                 {showGuide ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                 <span>参考线</span>
               </button>
+              {fitShouldersButton}
               <button
                 type="button"
                 onClick={handleReset}

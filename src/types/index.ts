@@ -49,6 +49,7 @@ export interface GeneratedPhotoResult {
 }
 
 export interface CachedCutout {
+  originalBlob?: Blob;
   id: string;
   createdAt: number;
   blob: Blob;

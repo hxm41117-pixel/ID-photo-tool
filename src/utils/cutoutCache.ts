@@ -46,7 +46,8 @@ export async function listCachedCutouts(): Promise<CachedCutout[]> {
 export async function saveCachedCutout(
   blob: Blob,
   width: number,
-  height: number
+  height: number,
+  originalBlob: Blob
 ): Promise<CachedCutout[]> {
   try {
     const db = await openDb();
@@ -54,6 +55,7 @@ export async function saveCachedCutout(
       id: `cutout_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       createdAt: Date.now(),
       blob,
+      originalBlob,
       width,
       height,
     };
