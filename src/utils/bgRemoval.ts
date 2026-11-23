@@ -1,3 +1,4 @@
+import { removeBackground, preload as preloadImgly } from '@imgly/background-removal';
 import { canvasToBlob } from './compression';
 
 export interface AiProgressInfo {
@@ -907,8 +908,7 @@ export function warmupLocalAiModelInBackground(): void {
 
   preloadPromise = (async () => {
     try {
-      const { preload } = await import('@imgly/background-removal');
-      await preload({
+      await preloadImgly({
         publicPath: localPublicPath,
         model: 'small',
       });
@@ -1084,8 +1084,6 @@ export async function aiPortraitCutout(
       ? '已命中本机缓存，正在启动 AI 人像抠图…'
       : '首次加载本地 AI 模型（完成后永久缓存）…',
   });
-
-  const { removeBackground } = await import('@imgly/background-removal');
 
   let sourceElement: HTMLImageElement | HTMLCanvasElement | null = originalImgForSampling;
   if (!sourceElement) {
