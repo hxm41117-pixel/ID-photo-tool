@@ -3,7 +3,7 @@ export type AppTab = 'id-photo' | 'converter';
 export type ExportFormat = 'image/jpeg' | 'image/png';
 export type ConverterFormat = 'image/jpeg' | 'image/png' | 'image/webp';
 
-export type BgChannelMode = 'fast' | 'ai' | 'original';
+export type BgChannelMode = 'ai' | 'original';
 
 export interface ScenePreset {
   id: string;

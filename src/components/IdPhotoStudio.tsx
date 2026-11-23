@@ -16,7 +16,6 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Sparkles,
-  Wand2,
   X,
 } from 'lucide-react';
 import {
@@ -34,7 +33,6 @@ import {
   AiProgressInfo,
   blobToRawImageData,
   cleanEdgeSpill,
-  fastSolidBackgroundCutout,
   sampleDominantBackgroundRgb,
 } from '../utils/bgRemoval';
 import { exportCanvasWithTargetKB, formatKB } from '../utils/compression';
@@ -79,11 +77,9 @@ export function IdPhotoStudio() {
   const [foregroundCanvas, setForegroundCanvas] = useState<HTMLCanvasElement | null>(null);
   const [renderVersion, setRenderVersion] = useState<number>(0);
 
-  const [bgMode, setBgMode] = useState<BgChannelMode>('fast');
+  const [bgMode, setBgMode] = useState<BgChannelMode>('ai');
   const [defringeStrength, setDefringeStrength] = useState<number>(80);
   const defringeStrengthRef = useRef<number>(80);
-  const [fastTolerance] = useState<number>(40);
-  const [isFastProcessing, setIsFastProcessing] = useState(false);
 
   // Floating Toast for unmistakable AI cutout & processing feedback (never fail silently)
   const [toast, setToast] = useState<{ type: 'error' | 'success' | 'info'; message: string } | null>(
@@ -233,14 +229,64 @@ export function IdPhotoStudio() {
       defringeStrengthRef.current = nextStrength;
       setDefringeStrength(nextStrength);
       if (bgMode === 'original') {
-        setBgMode('fast');
+        setBgMode('ai');
       }
       recomputeForegroundFromRaw(nextStrength);
     },
     [bgMode, recomputeForegroundFromRaw]
   );
 
-  // Import photo and immediately extract unmodified rawCutoutImageData + cleanEdgeSpill foreground
+  // Unified Local Offline AI portrait cutout -> saves immutable rawCutoutImageData & runs 3-step cleanEdgeSpill
+  const executeAiCutoutForPhoto = useCallback(
+    async (targetBlob: Blob, targetImg: HTMLImageElement) => {
+      try {
+        setErrorMsg(null);
+        setIsAiRunning(true);
+        setAiProgress({ percent: 5, stageLabel: '正在初始化本地 AI 抠图引擎…' });
+
+        const res = await aiPortraitCutout(
+          targetBlob,
+          targetImg,
+          defringeStrengthRef.current,
+          (info) => {
+            setAiProgress(info);
+          }
+        );
+
+        rawCutoutImageDataRef.current = res.rawCutoutImageData;
+        sampledBgRgbRef.current = res.sampledBgRgb;
+        setForegroundCanvas(res.foregroundCanvas);
+        setBgMode('ai');
+        setRenderVersion((v) => v + 1);
+
+        const updatedCache = await saveCachedCutout(
+          res.blob,
+          res.foregroundCanvas.width,
+          res.foregroundCanvas.height
+        );
+        setCachedCutouts(updatedCache);
+        if (updatedCache[0]) {
+          setActiveCacheId(updatedCache[0].id);
+        }
+        showToast('success', 'AI 人像抠图与发丝去白边完成', 3000);
+        return res.foregroundCanvas;
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? `智能 AI 抠图失败：${err.message}`
+            : '智能 AI 抠图失败，请刷新重试或改用默认浏览器打开';
+        setErrorMsg(msg);
+        showToast('error', msg, 7000);
+        return null;
+      } finally {
+        setIsAiRunning(false);
+        setTimeout(() => setAiProgress(null), 1200);
+      }
+    },
+    [showToast]
+  );
+
+  // Import photo and immediately default to AI model automatic portrait cutout
   const handleImportFile = useCallback(
     async (file: File | Blob) => {
       try {
@@ -248,28 +294,21 @@ export function IdPhotoStudio() {
         const img = await loadImageFromBlob(file);
         setOriginalBlob(file);
         setOriginalImg(img);
+        setForegroundCanvas(null);
+        rawCutoutImageDataRef.current = null;
+        sampledBgRgbRef.current = sampleDominantBackgroundRgb(img);
         setActiveCacheId(null);
         setTransform({ scale: 1, offsetX: 0, offsetY: 0 });
+        setBgMode('ai');
+        setRenderVersion((v) => v + 1);
         clearOutputs();
 
-        setIsFastProcessing(true);
-        const res = await fastSolidBackgroundCutout(
-          img,
-          fastTolerance,
-          defringeStrengthRef.current
-        );
-        rawCutoutImageDataRef.current = res.rawCutoutImageData;
-        sampledBgRgbRef.current = res.sampledBgRgb;
-        setForegroundCanvas(res.foregroundCanvas);
-        setBgMode('fast');
-        setRenderVersion((v) => v + 1);
+        await executeAiCutoutForPhoto(file, img);
       } catch (err) {
         setErrorMsg(err instanceof Error ? err.message : '导入图片失败');
-      } finally {
-        setIsFastProcessing(false);
       }
     },
-    [clearOutputs, fastTolerance]
+    [clearOutputs, executeAiCutoutForPhoto]
   );
 
   // Global Ctrl+V clipboard paste support (PC)
@@ -292,79 +331,19 @@ export function IdPhotoStudio() {
     return () => window.removeEventListener('paste', onPaste);
   }, [handleImportFile]);
 
-  // Fast channel: solid background flood-fill -> saves immutable rawCutoutImageData & runs cleanEdgeSpill
-  const runFastCutout = useCallback(async () => {
-    if (!originalImg) return;
-    try {
-      setErrorMsg(null);
-      setIsFastProcessing(true);
-      const res = await fastSolidBackgroundCutout(
-        originalImg,
-        fastTolerance,
-        defringeStrengthRef.current
-      );
-      rawCutoutImageDataRef.current = res.rawCutoutImageData;
-      sampledBgRgbRef.current = res.sampledBgRgb;
-      setForegroundCanvas(res.foregroundCanvas);
-      setBgMode('fast');
-      setActiveCacheId(null);
-      setRenderVersion((v) => v + 1);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : '快速换底失败');
-    } finally {
-      setIsFastProcessing(false);
-    }
-  }, [originalImg, fastTolerance]);
-
-  // Smart channel: 100% Free Local Offline AI portrait cutout -> saves immutable rawCutoutImageData & runs cleanEdgeSpill
+  // Re-run or switch back to AI cutout
   const runAiCutout = useCallback(async () => {
-    if (!originalBlob) {
+    if (!originalBlob || !originalImg) {
       showToast('error', '请先上传一张照片后再执行智能人像抠图');
       return;
     }
-    try {
-      setErrorMsg(null);
-      setIsAiRunning(true);
-      setAiProgress({ percent: 5, stageLabel: '正在初始化高精度本地抠图引擎…' });
-      showToast('info', '正在加载本地免费 AI 抠图模型，请稍候…', 3500);
-
-      const res = await aiPortraitCutout(
-        originalBlob,
-        originalImg,
-        defringeStrengthRef.current,
-        (info) => {
-          setAiProgress(info);
-        }
-      );
-
-      rawCutoutImageDataRef.current = res.rawCutoutImageData;
-      sampledBgRgbRef.current = res.sampledBgRgb;
-      setForegroundCanvas(res.foregroundCanvas);
+    if (rawCutoutImageDataRef.current) {
       setBgMode('ai');
-      setRenderVersion((v) => v + 1);
-
-      const updatedCache = await saveCachedCutout(
-        res.blob,
-        res.foregroundCanvas.width,
-        res.foregroundCanvas.height
-      );
-      setCachedCutouts(updatedCache);
-      if (updatedCache[0]) {
-        setActiveCacheId(updatedCache[0].id);
-      }
-      showToast('success', '高精度 AI 人像抠图完成，已自动应用 18px 发丝去溢色', 3500);
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? `智能 AI 抠图失败：${err.message}`
-          : '智能 AI 抠图失败，请刷新重试或改用默认浏览器打开';
-      setErrorMsg(msg);
-      showToast('error', msg, 7000);
-    } finally {
-      setIsAiRunning(false);
-      setTimeout(() => setAiProgress(null), 1500);
+      recomputeForegroundFromRaw(defringeStrengthRef.current);
+      return;
     }
-  }, [originalBlob, originalImg, showToast]);
+    await executeAiCutoutForPhoto(originalBlob, originalImg);
+  }, [originalBlob, originalImg, executeAiCutoutForPhoto, recomputeForegroundFromRaw, showToast]);
 
   // Load cached AI cutout from IndexedDB -> restores unmodified rawCutoutImageData & runs cleanEdgeSpill
   const handleSelectCachedCutout = useCallback(
@@ -433,7 +412,7 @@ export function IdPhotoStudio() {
       setFormat('image/png');
     }
     if (bgMode === 'original') {
-      setBgMode('fast');
+      setBgMode('ai');
     }
     recomputeForegroundFromRaw(defringeStrengthRef.current);
   };
@@ -450,18 +429,11 @@ export function IdPhotoStudio() {
       setRenderVersion((v) => v + 1);
       return cleaned;
     }
-    if (!originalImg) throw new Error('请先选择一张照片');
-    const res = await fastSolidBackgroundCutout(
-      originalImg,
-      fastTolerance,
-      defringeStrengthRef.current
-    );
-    rawCutoutImageDataRef.current = res.rawCutoutImageData;
-    sampledBgRgbRef.current = res.sampledBgRgb;
-    setForegroundCanvas(res.foregroundCanvas);
-    setRenderVersion((v) => v + 1);
-    return res.foregroundCanvas;
-  }, [originalImg, fastTolerance]);
+    if (!originalBlob || !originalImg) throw new Error('请先选择一张照片');
+    const canvas = await executeAiCutoutForPhoto(originalBlob, originalImg);
+    if (!canvas) throw new Error('AI 抠图尚未完成，请稍候重试');
+    return canvas;
+  }, [originalBlob, originalImg, executeAiCutoutForPhoto]);
 
   // Step 3A: Generate Single ID Photo (+ optional 6-inch print layout)
   const handleGenerateSingle = useCallback(async () => {
@@ -586,7 +558,7 @@ export function IdPhotoStudio() {
 
       const transparentFgCanvas = await ensureTransparentForeground();
       if (bgMode === 'original') {
-        setBgMode('fast');
+        setBgMode('ai');
       }
 
       const generated: GeneratedPhotoResult[] = [];
@@ -932,67 +904,47 @@ export function IdPhotoStudio() {
     </div>
   );
 
-  // Shared Cutout Channel & Edge Defringe Controls (rendered in Left Collapsible Panel on PC and Tab ③ on Mobile)
+  // Shared AI Cutout & Edge Fine-Tuning Controls (rendered in Left Collapsible Panel on PC and Tab ③ on Mobile)
   const renderCutoutAndDefringeControls = () => (
     <div className="space-y-3">
-      <div className="grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          disabled={isAiRunning || isFastProcessing}
-          onClick={runFastCutout}
-          className={`flex flex-col items-start p-2.5 rounded-xl border text-left transition-all ${
-            bgMode === 'fast'
-              ? 'border-slate-900 bg-slate-900 text-white'
-              : 'border-slate-200 hover:border-slate-300 bg-white text-slate-800'
-          }`}
-        >
-          <div className="flex items-center gap-1.5 text-xs font-semibold">
-            <Wand2 className="w-3.5 h-3.5" />
-            纯色底快速换底
-          </div>
-          <span
-            className={`text-[10px] mt-0.5 leading-snug ${
-              bgMode === 'fast' ? 'text-slate-300' : 'text-slate-500'
-            }`}
-          >
-            适合已有白/蓝/红底照片
-          </span>
-        </button>
-
-        <button
-          type="button"
-          disabled={isAiRunning || isFastProcessing}
-          onClick={runAiCutout}
-          className={`flex flex-col items-start p-2.5 rounded-xl border text-left transition-all ${
-            bgMode === 'ai'
-              ? 'border-slate-900 bg-slate-900 text-white'
-              : 'border-slate-200 hover:border-slate-300 bg-white text-slate-800'
-          }`}
-        >
-          <div className="flex items-center gap-1.5 text-xs font-semibold">
+      <div className="flex items-center justify-between gap-2 bg-white rounded-xl border border-slate-200/80 p-2.5">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-7 h-7 rounded-lg bg-slate-900 text-white flex items-center justify-center shrink-0">
             {isAiRunning ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
               <Sparkles className="w-3.5 h-3.5" />
             )}
-            {isAiRunning ? 'AI 抠图处理中…' : '智能人像抠图'}
           </div>
-          <span
-            className={`text-[10px] mt-0.5 leading-snug ${
-              bgMode === 'ai' ? 'text-slate-300' : 'text-slate-500'
-            }`}
-          >
-            {isAiRunning
-              ? aiProgress?.stageLabel || '正在初始化本地模型…'
-              : '本地离线轻量模型 (~42MB)'}
-          </span>
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-900 truncate">
+              {isAiRunning ? 'AI 智能人像抠图处理中…' : 'AI 智能人像抠图（默认启用）'}
+            </div>
+            <div className="text-[10px] text-slate-500 truncate">
+              {isAiRunning
+                ? aiProgress?.stageLabel || '正在加载本地轻量模型…'
+                : '本地轻量量化模型 · 缩放推理 + 原图高清合成'}
+            </div>
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={isAiRunning || !originalBlob || !originalImg}
+          onClick={() => {
+            if (originalBlob && originalImg) {
+              executeAiCutoutForPhoto(originalBlob, originalImg);
+            }
+          }}
+          className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-medium text-slate-700 shrink-0 disabled:opacity-50 transition-colors"
+        >
+          {isAiRunning ? '处理中…' : '重新抠图'}
         </button>
       </div>
 
-      {/* Unified Edge Defringe / Contraction Strength Slider (default 80%) */}
+      {/* Unified Edge Defringe / Erode & Feather / Color Decontamination Slider (default 80%) */}
       <div className="bg-white rounded-lg border border-slate-200/70 p-2.5 space-y-1.5">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-slate-700 font-medium">边缘去溢色/收缩强度（18px 深层）</span>
+          <span className="text-slate-700 font-medium">边缘微缩羽化与去白边/去溢色强度</span>
           <div className="flex items-center gap-1.5">
             {defringeStrength !== 80 && (
               <button
@@ -1016,21 +968,29 @@ export function IdPhotoStudio() {
           className="w-full h-1.5 bg-slate-200 rounded-lg cursor-pointer"
         />
         <div className="flex justify-between text-[10px] text-slate-400">
-          <span>0%（保留原始边缘）</span>
-          <span>80%（推荐，深层去蓝/红边）</span>
-          <span>100%（强力去溢收缩）</span>
+          <span>0%（仅清理低置信杂点）</span>
+          <span>80%（推荐，1~2px微缩+去白边）</span>
+          <span>100%（强力收缩去污）</span>
         </div>
       </div>
 
       <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
-        <span>发丝有旧底色残留时，可调高去溢色强度或点「智能人像抠图」</span>
-        {bgMode !== 'original' && (
+        <span>已自动开启低透明杂点清理、1~2px 边缘微缩羽化与发丝颜色去污</span>
+        {bgMode === 'original' ? (
+          <button
+            type="button"
+            onClick={runAiCutout}
+            className="text-slate-700 font-medium hover:text-slate-900 underline underline-offset-2 shrink-0 ml-2"
+          >
+            恢复 AI 抠图
+          </button>
+        ) : (
           <button
             type="button"
             onClick={() => setBgMode('original')}
             className="text-slate-500 hover:text-slate-800 underline underline-offset-2 shrink-0 ml-2"
           >
-            查看原图
+            对比原图
           </button>
         )}
       </div>
@@ -1404,7 +1364,7 @@ export function IdPhotoStudio() {
                   </div>
                 )}
 
-                {/* Default-Collapsed Panel: 抠图方式与边缘微调 */}
+                {/* Default-Collapsed Panel: 抠图微调 */}
                 <div className="mt-4 pt-3.5 border-t border-slate-100">
                   <button
                     type="button"
@@ -1413,15 +1373,11 @@ export function IdPhotoStudio() {
                   >
                     <span className="inline-flex items-center gap-1.5 font-medium">
                       <SlidersHorizontal className="w-3.5 h-3.5 text-slate-400" />
-                      抠图方式与边缘微调
+                      抠图微调
                     </span>
                     <span className="inline-flex items-center gap-1 text-[11px] text-slate-400">
-                      {bgMode === 'ai'
-                        ? '高精度 AI 抠图'
-                        : bgMode === 'fast'
-                          ? '纯色底快速换底'
-                          : '保留原图'}
-                      {' · '}去溢色 {defringeStrength}%
+                      {bgMode === 'ai' ? 'AI 智能人像抠图' : '保留原图'}
+                      {' · '}去白边/溢色 {defringeStrength}%
                       {isCutoutPanelOpen ? (
                         <ChevronUp className="w-3.5 h-3.5" />
                       ) : (
