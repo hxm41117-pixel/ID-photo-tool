@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Eye, EyeOff, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
+import { Eye, EyeOff, Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { TransformState } from '../types';
 
 interface PhotoCanvasEditorProps {
@@ -12,6 +12,12 @@ interface PhotoCanvasEditorProps {
   onTransformChange: (next: TransformState) => void;
   /** Compact mode for mobile sticky top preview stage (36vh~40vh) */
   compact?: boolean;
+  /** Whether AI portrait cutout is currently running */
+  isProcessing?: boolean;
+  /** Live AI progress percent (0..100) */
+  processingPercent?: number;
+  /** Live AI stage label */
+  processingLabel?: string;
 }
 
 export function PhotoCanvasEditor({
@@ -23,6 +29,9 @@ export function PhotoCanvasEditor({
   transform,
   onTransformChange,
   compact = false,
+  isProcessing = false,
+  processingPercent = 0,
+  processingLabel = '正在智能抠图…',
 }: PhotoCanvasEditorProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -295,6 +304,30 @@ export function PhotoCanvasEditor({
               肩线
             </text>
           </svg>
+        )}
+
+        {/* Explicit AI Matting Overlay on top of the canvas while original photo is still being segmented */}
+        {isProcessing && (
+          <div className="absolute inset-0 z-10 bg-slate-900/55 backdrop-blur-[2px] flex flex-col items-center justify-center p-3 text-center text-white select-none">
+            <div className="w-9 h-9 rounded-full bg-white/15 border border-white/25 flex items-center justify-center mb-2 shadow-sm">
+              <Loader2 className="w-4 h-4 animate-spin text-white" />
+            </div>
+            <div className="text-xs font-semibold tracking-wide">
+              正在 AI 智能抠图 ({processingPercent}%)
+            </div>
+            <div className="text-[10px] text-slate-200 mt-1 leading-snug max-w-[148px] line-clamp-2">
+              {processingLabel}
+            </div>
+            <div className="w-28 h-1.5 bg-white/20 rounded-full overflow-hidden mt-2.5">
+              <div
+                className="h-full bg-white rounded-full transition-all duration-200"
+                style={{ width: `${Math.max(8, Math.min(100, processingPercent))}%` }}
+              />
+            </div>
+            <div className="text-[10px] text-amber-200/95 mt-2 font-medium">
+              抠图完成后底色立即生效
+            </div>
+          </div>
         )}
       </div>
 

@@ -34,6 +34,7 @@ import {
   blobToRawImageData,
   cleanEdgeSpill,
   sampleDominantBackgroundRgb,
+  warmupLocalAiModelInBackground,
 } from '../utils/bgRemoval';
 import { exportCanvasWithTargetKB, formatKB } from '../utils/compression';
 import { deleteCachedCutout, listCachedCutouts, saveCachedCutout } from '../utils/cutoutCache';
@@ -147,9 +148,10 @@ export function IdPhotoStudio() {
   const [showWeChatGuide, setShowWeChatGuide] = useState<boolean>(false);
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
 
-  // Load IndexedDB cache on mount
+  // Load IndexedDB cache and pre-warm AI model in background on mount
   useEffect(() => {
     listCachedCutouts().then(setCachedCutouts);
+    warmupLocalAiModelInBackground();
   }, []);
 
   // Active layer rendered on framing canvas
@@ -401,7 +403,15 @@ export function IdPhotoStudio() {
       }
       setCustomDpiInput(String(found.dpi));
       setTargetKBInput(found.maxKB ? String(found.maxKB) : '');
-      recomputeForegroundFromRaw(defringeStrengthRef.current);
+      if (isAiRunning) {
+        showToast(
+          'info',
+          `已设为「${found.label} · ${found.defaultBgName}」，抠图完成后立即生效`,
+          2500
+        );
+      } else {
+        recomputeForegroundFromRaw(defringeStrengthRef.current);
+      }
     }
   };
 
@@ -413,6 +423,12 @@ export function IdPhotoStudio() {
     }
     if (bgMode === 'original') {
       setBgMode('ai');
+    }
+    if (isAiRunning) {
+      const preset = BG_COLOR_PRESETS.find((b) => b.hex.toLowerCase() === hex.toLowerCase());
+      const bgName = preset ? preset.label : '自定义底色';
+      showToast('info', `已预选「${bgName}」，正在完成 AI 抠图（${aiProgress?.percent ?? 50}%），完成后自动换底…`, 2500);
+      return;
     }
     recomputeForegroundFromRaw(defringeStrengthRef.current);
   };
@@ -825,6 +841,17 @@ export function IdPhotoStudio() {
   // Shared Background Color & Format Controls (rendered in Step 2 on PC and Tab ② on Mobile)
   const renderBackgroundAndFormatControls = () => (
     <div className="space-y-3.5">
+      {isAiRunning && (
+        <div className="bg-amber-50 border border-amber-200/90 rounded-xl px-3 py-2 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+          <div className="flex items-center gap-2 min-w-0">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-600 shrink-0" />
+            <span className="truncate">
+              正在抠除原图背景（<strong>{aiProgress?.percent ?? 15}%</strong>），您当前选择的<strong>「{activeBgLabel}」</strong>将在抠图完成后立即生效
+            </span>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-2.5">
         {BG_COLOR_PRESETS.map((c) => {
           const selected = bgHex.toLowerCase() === c.hex.toLowerCase();
@@ -859,7 +886,12 @@ export function IdPhotoStudio() {
                 )}
               </span>
               <span>{c.label}</span>
-              {isRecommended && (
+              {selected && isAiRunning && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-amber-400/25 text-amber-200">
+                  待生效
+                </span>
+              )}
+              {isRecommended && !(selected && isAiRunning) && (
                 <span
                   className={`text-[10px] px-1.5 py-0.2 rounded-full ${
                     selected ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
@@ -1169,6 +1201,9 @@ export function IdPhotoStudio() {
                   transform={transform}
                   onTransformChange={setTransform}
                   compact={true}
+                  isProcessing={isAiRunning}
+                  processingPercent={aiProgress?.percent ?? 10}
+                  processingLabel={aiProgress?.stageLabel ?? '正在分离人像与背景…'}
                 />
 
                 {aiProgress && (
@@ -1264,9 +1299,9 @@ export function IdPhotoStudio() {
             <div className="fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 px-3.5 py-2.5 flex items-center gap-2 shadow-lg">
               <button
                 type="button"
-                disabled={isGenerating || isBatchGenerating}
+                disabled={isAiRunning || isGenerating || isBatchGenerating}
                 onClick={handleGenerateBatchSet}
-                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-900 text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-60 shrink-0"
+                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-900 text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-50 shrink-0"
               >
                 {isBatchGenerating ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1278,16 +1313,26 @@ export function IdPhotoStudio() {
 
               <button
                 type="button"
-                disabled={isGenerating || isBatchGenerating}
+                disabled={isAiRunning || isGenerating || isBatchGenerating}
                 onClick={handleGenerateSingle}
                 className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 text-white text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-60"
               >
-                {isGenerating ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                {isAiRunning ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>正在抠图中 ({aiProgress?.percent ?? 10}%)…</span>
+                  </>
+                ) : isGenerating ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>正在生成…</span>
+                  </>
                 ) : (
-                  <Check className="w-3.5 h-3.5" />
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>生成证件照</span>
+                  </>
                 )}
-                生成证件照
               </button>
 
               {hasAnyResult && (
@@ -1344,6 +1389,9 @@ export function IdPhotoStudio() {
                   bgHex={bgHex}
                   transform={transform}
                   onTransformChange={setTransform}
+                  isProcessing={isAiRunning}
+                  processingPercent={aiProgress?.percent ?? 10}
+                  processingLabel={aiProgress?.stageLabel ?? '正在分离人像与背景…'}
                 />
 
                 {aiProgress && (
@@ -1467,21 +1515,31 @@ export function IdPhotoStudio() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   <button
                     type="button"
-                    disabled={isGenerating || isBatchGenerating}
+                    disabled={isAiRunning || isGenerating || isBatchGenerating}
                     onClick={handleGenerateSingle}
                     className="inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 active:scale-[0.99] transition-all disabled:opacity-60"
                   >
-                    {isGenerating ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                    {isAiRunning ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>正在 AI 抠图中 ({aiProgress?.percent ?? 10}%)…</span>
+                      </>
+                    ) : isGenerating ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>正在生成…</span>
+                      </>
                     ) : (
-                      <Check className="w-4 h-4" />
+                      <>
+                        <Check className="w-4 h-4" />
+                        <span>生成当前证件照</span>
+                      </>
                     )}
-                    生成当前证件照
                   </button>
 
                   <button
                     type="button"
-                    disabled={isGenerating || isBatchGenerating}
+                    disabled={isAiRunning || isGenerating || isBatchGenerating}
                     onClick={handleGenerateBatchSet}
                     className="inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl border border-slate-300 bg-white text-slate-900 text-sm font-medium hover:bg-slate-50 active:scale-[0.99] transition-all disabled:opacity-60"
                   >
