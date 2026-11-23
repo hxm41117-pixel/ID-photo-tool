@@ -994,14 +994,14 @@ export function IdPhotoStudio() {
           className="w-full h-1.5 bg-slate-200 rounded-lg cursor-pointer"
         />
         <div className="flex justify-between text-[10px] text-slate-400">
-          <span>0% 原始蒙版</span>
+          <span>0% 关闭边缘修正</span>
           <span>80% 默认</span>
           <span>100% 完整修正</span>
         </div>
       </div>
 
       <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
-        <span>使用原图颜色修复轮廓和内部小孔</span>
+        <span>自动填实人物内部，去白边仅作用于外轮廓</span>
         {bgMode === 'original' ? (
           <button
             type="button"
